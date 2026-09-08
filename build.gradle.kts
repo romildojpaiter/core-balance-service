@@ -8,7 +8,7 @@ plugins {
 
 group = "br.com.itau"
 version = "0.0.1-SNAPSHOT"
-description = "itau-code-challange-starter-kit"
+description = "core-balance-service"
 
 java {
 	toolchain {
@@ -27,6 +27,10 @@ dependencies {
 	implementation("tools.jackson.module:jackson-module-kotlin")
 	implementation("software.amazon.awssdk:dynamodb")
 	implementation("org.springframework.boot:spring-boot-starter-kafka")
+	// FR-053 requires consumer lag, which is not observable without the Kafka client metrics that
+	// Micrometer binds automatically. Justified under Constitution XV in plan.md > Complexity Tracking.
+	implementation("org.springframework.boot:spring-boot-starter-actuator")
+	implementation("io.micrometer:micrometer-registry-prometheus")
 	testImplementation("org.springframework.boot:spring-boot-starter-webmvc-test")
 	testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
 	testImplementation("com.lemonappdev:konsist:0.17.3")
@@ -43,8 +47,9 @@ kotlin {
 // kept out of `test`/`check` so the default build stays infra-free and gate-friendly.
 sourceSets {
 	create("integrationTest") {
-		kotlin.srcDir("src/integrationTest/kotlin")
-		resources.srcDir("src/integrationTest/resources")
+		// Both directories are already the conventional locations for this source set. Declaring
+		// them again registers each path twice, which makes `processIntegrationTestResources` see
+		// every resource as a duplicate and fail — invisible only while the directory is empty.
 		compileClasspath += sourceSets.main.get().output + sourceSets.test.get().output
 		runtimeClasspath += sourceSets.main.get().output + sourceSets.test.get().output
 	}
@@ -68,6 +73,19 @@ val integrationTest =
 		}
 	}
 
+// Static analysis audit (T095, Constitution XV — Simplicity).
+//
+// This project deliberately has **no ktlint, no detekt and no spotless**. The quality gates it does
+// have are the ones that catch defects rather than opinions:
+//
+//   - Konsist architecture tests — dependency direction, no floating point in production, no locks.
+//     Each was verified by introducing a violation and confirming the build breaks.
+//   - JaCoCo, 90% instruction coverage, wired into `check`.
+//   - CodeQL, in .github/workflows/codeql.yml.
+//
+// Adding a formatter now would be complexity without a requirement: it would produce a large
+// mechanical diff over code no linter had ever seen, and it enforces style, which is not where this
+// system's risk lives. Recommended as a separate change, on its own, if the team wants it.
 jacoco {
 	toolVersion = "0.8.12"
 }

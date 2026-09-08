@@ -28,16 +28,22 @@ for ((i = 1; i <= COUNT; i++)); do
   tx_timestamp=$((NOW_US - $(random_offset_us "$WINDOW_10MIN_US")))
   account_created_at=$((NOW_US - $(random_offset_us "$WINDOW_10YEARS_US")))
 
-  printf '{"transaction": {"id": "%s", "type": "%s", "amount": %s, "currency": "BRL", "status": "%s", "timestamp": %s}, "account": {"id": "%s", "owner": "%s", "created_at": %s, "status": "ENABLED", "balance": {"amount": %s, "currency": "BRL"}}}\n' \
+  account_id="$(cat /proc/sys/kernel/random/uuid)"
+
+  # Keyed by account.id (Constitution VII): events for one account land on one partition and are
+  # therefore consumed in order. This is a contention optimisation, never the ordering guarantee —
+  # that lives in the DynamoDB conditional write, which is indifferent to arrival order.
+  printf '%s\t{"transaction": {"id": "%s", "type": "%s", "amount": %s, "currency": "BRL", "status": "%s", "timestamp": %s}, "account": {"id": "%s", "owner": "%s", "created_at": %s, "status": "ENABLED", "balance": {"amount": %s, "currency": "BRL"}}}\n' \
+    "$account_id" \
     "$(cat /proc/sys/kernel/random/uuid)" \
     "$(random_choice CREDIT DEBIT)" \
     "$(random_amount 0.01 10000)" \
     "$(random_choice APPROVED DECLINED)" \
     "$tx_timestamp" \
-    "$(cat /proc/sys/kernel/random/uuid)" \
+    "$account_id" \
     "$(cat /proc/sys/kernel/random/uuid)" \
     "$account_created_at" \
     "$(random_amount 0.00 20000)"
-done | rpk topic produce "${TOPIC}" --brokers "${BROKERS}" -f '%v\n'
+done | rpk topic produce "${TOPIC}" --brokers "${BROKERS}" -f '%k\t%v\n'
 
 echo "Done. Published ${COUNT} event(s) to '${TOPIC}'."

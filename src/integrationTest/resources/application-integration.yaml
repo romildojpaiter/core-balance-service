@@ -1,0 +1,36 @@
+# Profile overrides for integration tests, activated by @ActiveProfiles("integration").
+#
+# This is a *profile* file, not a second `application.yaml`, and the distinction matters: a plain
+# `application.yaml` in this source set shadows the one in src/main entirely rather than merging with
+# it, so every policy the tests exist to verify — ack mode, DLQ routing, table name — would silently
+# come from this file instead of from production configuration. As a profile it layers on top, and
+# only the keys below differ.
+spring:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:19092}
+    consumer:
+      # Each run joins a fresh group and reads the topic from the start, so a test never depends on
+      # offsets a previous run happened to leave behind.
+      auto-offset-reset: earliest
+
+dynamodb:
+  endpoint: ${DYNAMODB_ENDPOINT:http://localhost:8000}
+  region: ${DYNAMODB_REGION:us-east-1}
+  table-name: ${BALANCE_TABLE_NAME:AccountBalances}
+
+balance:
+  kafka:
+    concurrency: 1
+    retry:
+      # A short budget keeps the DLQ tests fast. The shape of the policy is asserted in the unit
+      # tests; what the integration test proves is where a message ends up, not how long it waited.
+      max-attempts: 2
+      initial-interval: 50ms
+      multiplier: 2.0
+      max-interval: 200ms
+      jitter: 10ms
+
+logging:
+  level:
+    org.apache.kafka: WARN
+    org.springframework.kafka: WARN

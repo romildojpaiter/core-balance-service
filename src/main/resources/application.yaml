@@ -1,18 +1,61 @@
 spring:
   application:
-    name: itau-code-challange-starter-kit
+    name: core-banking-balance-service
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:19092}
     consumer:
-      group-id: ${KAFKA_CONSUMER_GROUP_ID:hello-greeting-template-consumer}
+      # Constitution XII: an offset must never be committed before processing reaches a terminal
+      # outcome. Auto-commit can acknowledge records the listener never finished, so it stays off and
+      # the container commits after the listener returns (see listener.ack-mode below).
+      enable-auto-commit: false
       auto-offset-reset: earliest
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # The payload is consumed as String on purpose: keeping the original bytes available inside the
+      # listener is what lets the DLQ carry the untouched payload (FR-039).
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      max-poll-records: 50
+    producer:
+      # Used only by the dead-letter publisher.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+    listener:
+      ack-mode: RECORD
 
 dynamodb:
   endpoint: ${DYNAMODB_ENDPOINT:http://localhost:8000}
   region: ${DYNAMODB_REGION:us-east-1}
-  table-name: ${GREETING_TABLE_NAME:GreetingMessages}
+  table-name: ${BALANCE_TABLE_NAME:AccountBalances}
 
-greeting-templates:
-  topic-name: ${GREETING_TEMPLATES_TOPIC:greeting-templates}
+balance:
+  kafka:
+    topic: ${TRANSACTIONS_TOPIC:transactions-events}
+    dlq-topic: ${TRANSACTIONS_DLQ_TOPIC:transactions-events.dlq}
+    consumer-group-id: ${KAFKA_CONSUMER_GROUP_ID:core-banking-balance-consumer}
+    concurrency: ${KAFKA_CONSUMER_CONCURRENCY:3}
+    retry:
+      # Single retry authority (ADR-005): the AWS SDK retries are disabled in DynamoDbConfig so the
+      # attempt budget below is the real one. Total window is ~1.4s, two orders of magnitude under
+      # max.poll.interval.ms (5 min), so retrying never triggers a rebalance.
+      max-attempts: 4
+      initial-interval: 200ms
+      multiplier: 2.0
+      max-interval: 5s
+      jitter: 100ms
+  api:
+    # America/Sao_Paulo renders as -03:00 today because Brazil abolished DST in 2019. If it ever
+    # returns, this zone alternates with -02:00; set a fixed offset here if the contract requires one.
+    timezone: ${BALANCE_API_TIMEZONE:America/Sao_Paulo}
+
+logging:
+  structured:
+    format:
+      console: ecs
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus

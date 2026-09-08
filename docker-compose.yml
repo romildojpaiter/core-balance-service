@@ -4,13 +4,21 @@ services:
       context: .
       target: runtime
     ports:
-      - "8080:8080"
+      # A port range, not a fixed port: `docker compose up --scale app=3` — the command the quickstart
+      # uses to prove several instances cannot corrupt a balance — fails with "port is already
+      # allocated" against a fixed mapping. The first replica still lands on 8080, so `make up` and
+      # every documented curl are unchanged.
+      # 8081 belongs to redpanda-console, so the range spans one extra port: Docker skips an
+      # allocated port inside a range, and three replicas land on 8080, 8082 and 8083.
+      - "8080-8083:8080"
     environment:
       DYNAMODB_ENDPOINT: http://dynamodb:8000
       DYNAMODB_REGION: us-east-1
-      GREETING_TABLE_NAME: GreetingMessages
+      BALANCE_TABLE_NAME: AccountBalances
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
-      GREETING_TEMPLATES_TOPIC: greeting-templates
+      TRANSACTIONS_TOPIC: transactions-events
+      TRANSACTIONS_DLQ_TOPIC: transactions-events.dlq
+      KAFKA_CONSUMER_GROUP_ID: core-banking-balance-consumer
     depends_on:
       - dynamodb
       - dynamodb-seed
@@ -33,7 +41,7 @@ services:
       AWS_SECRET_ACCESS_KEY: local
       AWS_DEFAULT_REGION: us-east-1
       DYNAMODB_ENDPOINT_URL: http://dynamodb:8000
-      GREETING_TABLE_NAME: GreetingMessages
+      BALANCE_TABLE_NAME: AccountBalances
     volumes:
       - ./infra/dynamodb:/dynamodb-seed:ro
     entrypoint: ["/bin/bash", "/dynamodb-seed/seed.sh"]
@@ -74,7 +82,8 @@ services:
       - redpanda
     environment:
       REDPANDA_BROKERS: redpanda:9092
-      GREETING_TEMPLATES_TOPIC: greeting-templates
+      TRANSACTIONS_TOPIC: transactions-events
+      TRANSACTIONS_DLQ_TOPIC: transactions-events.dlq
     volumes:
       - ./infra/redpanda:/redpanda-seed:ro
     entrypoint: ["/bin/bash", "-c", "/redpanda-seed/config.sh && /redpanda-seed/seed.sh"]

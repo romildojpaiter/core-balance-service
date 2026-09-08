@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-IMAGE := itau-hello-world
+IMAGE := core-banking-balance
 COMPOSE := docker compose
 HTTP_DIR := http
 COMPOSE_PROJECT := $(notdir $(CURDIR))
@@ -40,31 +40,31 @@ http: ## Call all .http files against the running app (no local deps, runs via D
 	docker run --rm \
 		--add-host=host.docker.internal:host-gateway \
 		-v "$(CURDIR)/$(HTTP_DIR)":/http -w /http \
-		node:20-alpine sh -c "npx --yes httpyac send hello.http --all -e docker"
+		node:20-alpine sh -c "npx --yes httpyac send balances.http --all -e docker"
 
 .PHONY: db-up
-db-up: ## Start DynamoDB Local + web console and (re)seed the GreetingMessages table
+db-up: ## Start DynamoDB Local + web console and create the AccountBalances table
 	$(COMPOSE) up dynamodb dynamodb-seed dynamodb-admin -d
 
 .PHONY: db-seed
-db-seed: ## Re-run the seed job (table creation is idempotent, items are overwritten)
+db-seed: ## Re-run the seed job (table creation is idempotent)
 	$(COMPOSE) up dynamodb-seed
 
 .PHONY: db-scan
-db-scan: ## List greeting messages currently stored in DynamoDB
+db-scan: ## List account balances currently stored in DynamoDB
 	$(COMPOSE) run --rm --entrypoint aws dynamodb-seed \
-		dynamodb scan --table-name GreetingMessages --endpoint-url http://dynamodb:8000 --region us-east-1
+		dynamodb scan --table-name AccountBalances --endpoint-url http://dynamodb:8000 --region us-east-1
 
 .PHONY: db-down
 db-down: ## Stop DynamoDB Local + web console
 	$(COMPOSE) stop dynamodb dynamodb-seed dynamodb-admin
 
 .PHONY: kafka-up
-kafka-up: ## Start Redpanda + Console and (re)seed the greeting-templates topic
+kafka-up: ## Start Redpanda + Console and create the transactions-events topics
 	$(COMPOSE) up redpanda redpanda-seed redpanda-console -d
 
 .PHONY: kafka-seed
-kafka-seed: ## Re-run the seed job (topic creation is idempotent, messages are re-published)
+kafka-seed: ## Re-run the seed job (topic creation is idempotent)
 	$(COMPOSE) up redpanda-seed
 
 .PHONY: kafka-topic-create

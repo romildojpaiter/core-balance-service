@@ -1,4 +1,4 @@
-# itau-code-challange-starter-kit
+# core-balance-service
 
 [![Build](../../actions/workflows/build.yml/badge.svg)](../../actions/workflows/build.yml)
 [![Test & Coverage](../../actions/workflows/test.yml/badge.svg)](../../actions/workflows/test.yml)
@@ -33,6 +33,7 @@
 - [Comandos do Makefile](#comandos-do-makefile)
 - [Testes](#testes)
 - [Cobertura de testes](#cobertura-de-testes)
+- [Decisões arquiteturais](#decisões-arquiteturais)
 
 ## Stack
 
@@ -46,7 +47,7 @@
 | Serialização JSON | Jackson 3 (`tools.jackson`, incluindo módulo Kotlin) |
 | Banco de dados | Amazon DynamoDB (via AWS SDK for Java v2) |
 | Mensageria | Kafka (protocolo) via Spring Kafka, broker real = Redpanda |
-| Testes | JUnit 5, Mockito, Konsist (teste de arquitetura), MockMvc |
+| Testes | JUnit 5, Konsist (testes de arquitetura), MockMvc |
 | Cobertura | JaCoCo (gate mínimo de 90% de instruções) |
 | Containers | Docker + Docker Compose |
 
@@ -75,123 +76,186 @@ Essa regra é validada automaticamente por um **teste de arquitetura** (`Hexagon
 ### Camadas
 
 #### 1. `domain` — núcleo do negócio
-Modelos e exceções de domínio, sem nenhuma dependência externa (nem Spring).
 
-- `domain/model/Greeting.kt` — a saudação já renderizada, pronta para resposta.
-- `domain/model/GreetingTemplate.kt` — um template de saudação (`id` + `template` com placeholder `%s`).
-- `domain/exception/BlankRequesterNameException.kt` — nome do solicitante em branco.
-- `domain/exception/InvalidGreetingTemplateException.kt` — template inválido (id ou texto em branco).
+Modelos, invariantes e a decisão de elegibilidade. Não importa Spring, AWS SDK, Kafka nem Jackson — restrição verificada por teste.
+
+- `domain/model/Money.kt` — quantia exata com moeda. Deliberadamente **sem** construtor `Double` e **sem** `plus`/`minus`: a primeira ausência torna a violação de precisão impossível de escrever, a segunda torna impossível derivar saldo por aritmética.
+- `domain/model/EventTimestamp.kt` — o marcador de frescor, em microssegundos desde a época Unix.
+- `domain/model/Balance.kt` — o estado corrente de uma conta: quantia, moeda, instante e transação de origem.
+- `domain/model/TransactionEvent.kt` — o agregado de ingestão. Único lugar que julga elegibilidade (`APPROVED` **e** `ENABLED`) e único que converte evento em saldo, copiando `account.balance` **literalmente**.
+- `domain/eligibility/`, `domain/outcome/` — a decisão de elegibilidade e a classificação do desfecho do processamento.
 
 #### 2. `port` — contratos do hexágono
-Interfaces que definem a borda entre o núcleo e o mundo externo.
 
-- **`port/input`** (portas de entrada / *driving*) — o que a aplicação **oferece**:
-  - `GetGreetingUseCase` — obter uma saudação para um nome.
-  - `SaveGreetingTemplateUseCase` — persistir um novo template de saudação.
-- **`port/output`** (portas de saída / *driven*) — o que a aplicação **precisa**:
-  - `GreetingTemplateProvider` — obter um template aleatório.
-  - `GreetingTemplateRepository` — salvar um template.
+- **Input**: `ProcessTransactionEventUseCase` (ingestão), `GetBalanceUseCase` (consulta).
+- **Output**: `BalanceWriter` (escrita condicional), `BalanceReader` (leitura consistente), `BalanceTelemetry` (a lista de coisas observáveis, revisável em um arquivo), `TransientProcessingException` (o vocabulário de falha que o writer oferece a qualquer chamador).
 
 #### 3. `application` — casos de uso
-Implementa os *input ports*, orquestrando regras de negócio usando apenas `domain` e `port` (nunca conhece detalhes de HTTP, Kafka ou DynamoDB).
 
-- `GreetingService` — valida o nome (não pode ser vazio/branco), pede um template aleatório e monta a saudação final.
-- `SaveGreetingTemplateService` — valida `id`/`template` (não podem ser vazios/brancos) e delega a persistência ao repositório.
+- `ProcessTransactionEventService` — sequencia elegibilidade → escrita condicional → desfecho. **Não** decide elegibilidade (é do domínio) nem ordenação (é do banco). Um evento inelegível nunca chega ao writer: é assim que o marcador de frescor não avança.
+- `GetBalanceService` — devolve o saldo persistido, ou lança `BalanceNotFoundException`. **Nunca** devolve `0.00` para conta desconhecida.
 
 #### 4. `adapter` — integrações com o mundo externo
-Implementações concretas das portas, organizadas por tecnologia. Cada adaptador é isolado — trocar um por outro não exige alterar `domain` nem `application`.
 
-- **`adapter/input/web`** (*driving adapter*, HTTP):
-  - `GreetingController` — expõe `GET /hello`, sempre responde em JSON.
-- **`adapter/input/kafka`** (*driving adapter*, mensageria):
-  - `GreetingTemplateConsumer` — `@KafkaListener` que consome o tópico `greeting-templates`, desserializa a mensagem (usando o `ObjectMapper` Jackson 3 da própria aplicação) e chama `SaveGreetingTemplateUseCase`.
-- **`adapter/output/dynamodb`** (*driven adapter*, persistência):
-  - `DynamoDbGreetingTemplateProvider` — implementa `GreetingTemplateProvider` (faz `Scan` na tabela e escolhe um template aleatório).
-  - `DynamoDbGreetingTemplateWriter` — implementa `GreetingTemplateRepository` (faz `PutItem`).
-  - `DynamoDbConfig` — configura o `DynamoDbClient` (endpoint, região, credenciais locais).
+- **`adapter/input/web`** — `BalanceController` expõe `GET /balances/{accountId}`; `BalanceResponseMapper` renderiza dinheiro como texto e o instante em ISO-8601 local; `BalanceExceptionHandler` traduz exceções em status sem vazar detalhe interno; `CorrelationIdFilter` popula o MDC.
+- **`adapter/input/kafka`** — `TransactionEventConsumer` recebe o payload como `String` (manter os bytes originais é o que permite publicar na DLQ sem reserialização); `TransactionEventMessageMapper` faz a triagem em três vias; `KafkaConsumerConfig` concentra ack mode, retry e DLQ.
+- **`adapter/output/dynamodb`** — `DynamoDbBalanceWriter` executa a escrita condicional que sustenta toda a corretude; `DynamoDbBalanceReader` faz leitura fortemente consistente; `BalanceItemMapper` traduz o item.
+- **`adapter/output/observability`** — `MicrometerBalanceTelemetry`, único lugar que conhece Micrometer.
+
 
 ### Fluxo de dados
 
 ```mermaid
-flowchart LR
-    Kafka(["Kafka / Redpanda<br/>tópico greeting-templates"]) --> Consumer[GreetingTemplateConsumer]
-    Consumer --> SaveUC[SaveGreetingTemplateUseCase]
-    SaveUC --> Writer[DynamoDbGreetingTemplateWriter]
-    Writer --> DB[("DynamoDB<br/>GreetingMessages")]
+graph TD
+    Kafka(["Kafka / Redpanda<br/>tópico transactions-events"]) --> Consumer[TransactionEventConsumer]
+    Consumer --> Mapper[TransactionEventMessageMapper<br/>triagem em três vias]
+    Mapper -->|outro fluxo| Discard(["descartado e contabilizado<br/>offset confirmado"])
+    Mapper -->|inválido| DLQ(["transactions-events.dlq"])
+    Mapper -->|evento| ProcessUC[ProcessTransactionEventUseCase]
+    ProcessUC -->|inelegível| Ignored(["ignorado — nenhuma escrita"])
+    ProcessUC -->|elegível| Writer[DynamoDbBalanceWriter<br/>PutItem condicional]
+    Writer --> DB[("DynamoDB<br/>AccountBalances")]
 
-    HTTP(["HTTP GET /hello"]) --> Controller[GreetingController]
-    Controller --> GetUC[GetGreetingUseCase]
-    GetUC --> Provider[DynamoDbGreetingTemplateProvider]
-    Provider --> DB
+    HTTP(["HTTP GET /balances/{accountId}"]) --> Controller[BalanceController]
+    Controller --> GetUC[GetBalanceUseCase]
+    GetUC --> Reader[DynamoDbBalanceReader<br/>GetItem consistente]
+    Reader --> DB
 ```
 
-Ou seja: novos templates chegam via Kafka e são persistidos no DynamoDB; o endpoint HTTP lê aleatoriamente qualquer template já persistido (seja o seed inicial ou os que vieram via Kafka) e devolve a saudação renderizada.
+Os dois caminhos não compartilham nenhuma linha de código — encontram-se apenas na tabela. É isso que torna barato separá-los em dois deployables quando houver motivo ([ADR-007](docs/adr/007-single-deployable-with-profile-split.md)).
 
 ## Estrutura de pastas
 
 ```
 src/main/kotlin/br/com/itau/challenge/
 ├── Application.kt                          # bootstrap Spring Boot
-└── hello/
-    ├── domain/                             # modelos e exceções de domínio
-    ├── port/{input,output}/                # contratos (interfaces)
-    ├── application/                        # casos de uso
+└── balance/
+    ├── domain/{model,eligibility,outcome,exception}/   # núcleo, sem framework
+    ├── port/{input,output}/                            # contratos (interfaces)
+    ├── application/                                    # casos de uso
     └── adapter/
-        ├── input/{web,kafka}/              # driving adapters
-        └── output/dynamodb/                # driven adapters
+        ├── input/web/{dto,mapper}/                     # REST
+        ├── input/kafka/{config,dto,mapper,exception}/  # ingestão
+        ├── output/dynamodb/                            # persistência
+        └── output/observability/                       # métricas e logs
 
-src/test/kotlin/                            # testes unitários (sem infra externa)
+src/test/kotlin/                            # testes unitários e de arquitetura (sem infra externa)
 src/integrationTest/kotlin/                 # testes de integração (infra real via Docker)
 
+docs/adr/                                   # decisões arquiteturais registradas
+specs/001-core-banking-balance/             # spec, plano, tasks e contratos
+
 infra/                                       # seeds de infraestrutura local (Docker Compose)
-├── dynamodb/                               # script + dados de seed do DynamoDB
-└── redpanda/                               # script + dados de seed do tópico Kafka
+├── dynamodb/                               # criação da tabela AccountBalances
+└── redpanda/                               # config do cluster e criação dos tópicos
 
 http/                                       # arquivos .http para chamar a API manualmente
 ```
 
 ## Endpoints da API
 
-### `GET /hello`
+### `GET /balances/{accountId}`
 
-Retorna uma saudação aleatória para o nome informado. **Sempre responde em JSON**, inclusive em erros.
+Devolve o saldo corrente da conta: o snapshot autoritativo do evento elegível de **maior** `transaction.timestamp` já aplicado. O serviço é uma **projeção** de uma origem upstream, não um ledger — não calcula, não acumula e não reconcilia.
 
-| Parâmetro | Obrigatório | Descrição |
-|-|-|-|
-| `name` | Sim | Nome do solicitante (não pode ser vazio/branco) |
+| Parâmetro | Onde | Obrigatório | Descrição |
+|-|-|-|-|
+| `accountId` | path | Sim | Não vazio, apenas `[A-Za-z0-9-]`. Validado **antes** de qualquer acesso ao armazenamento |
+| `X-Correlation-Id` | header | Não | Se ausente, é gerado e devolvido na resposta |
 
 **Sucesso:**
 ```
-GET /hello?name=Ada
+GET /balances/5b19c8b6-0cc4-4c72-a989-0c2ee15fa975
 200 OK
-{"message": "Hello, Ada!"}
+{
+  "id": "5b19c8b6-0cc4-4c72-a989-0c2ee15fa975",
+  "owner": "315e3cfe-f4af-4cd2-b298-a449e614349a",
+  "balance": { "amount": 183.12, "currency": "BRL" },
+  "updated_at": "2025-07-05T18:04:13.433-03:00"
+}
 ```
 
-**Erro (nome ausente ou em branco):** resposta de erro padrão do Spring Boot (JSON, já que não há views HTML configuradas).
+O corpo tem **exatamente estas quatro chaves**. `lastTransactionId` continua persistido e nos logs estruturados, mas não é exposto: uma chave a mais faria um cliente estrito rejeitar a resposta inteira.
 
-Exemplos prontos em [`http/hello.http`](http/hello.http) (execute com a extensão REST Client do VS Code, o cliente HTTP do IntelliJ, ou via `make http`).
+`balance.amount` é **número JSON com exatamente duas casas**, serializado de `BigDecimal` — a escala sobrevive à serialização (`150.00` sai como `150.00`, nunca `150`) e o valor não transita por `Float`/`Double` em ponto algum do sistema. Na persistência ele continua sendo gravado como texto, porque o tipo `N` do DynamoDB removeria as casas decimais ([ADR-006](docs/adr/006-decimal-string-money-representation.md), emendada em 2026-09-07).
+
+`owner` está **sempre presente**: `account.owner` é obrigatório na ingestão, então um evento sem titular vai para a DLQ e nenhum saldo sem titular chega a existir.
+
+> **Conferindo `amount` na mão?** A ferramenta pode apagar as casas decimais. O serviço emite `150.00`; Postman, Insomnia, REST Client do VS Code e o DevTools do navegador rodam `JSON.parse`, que lê o literal num `double` de 64 bits — onde `150.00` e `150` são o mesmo valor — e exibem **`150`**. A perda é do visualizador, não do serviço. Para ver os bytes reais: `curl -s http://localhost:8080/balances/$ACC | od -c`, ou `| jq`, que preserva o literal. Só valores com zero à direita são afetados — `183.12` chega íntegro em qualquer cliente.
+
+`updated_at` deriva de `transaction.timestamp` — descreve **quando a transação ocorreu na origem**, não quando o registro foi gravado. Renderizado com offset local (fuso configurável) e milissegundos por truncamento ([ADR-010](docs/adr/010-response-instant-rendering.md)).
+
+**Erros:**
+
+| Status | `code` | Quando |
+|-|-|-|
+| `400` | `INVALID_ACCOUNT_ID` | formato inválido — o armazenamento **não** é consultado |
+| `404` | `BALANCE_NOT_FOUND` | a conta não possui estado corrente. O sistema **não** inventa `0.00`: afirmar zero para uma conta desconhecida afirmaria um fato financeiro que ele não conhece |
+| `500` | `INTERNAL_ERROR` | corpo genérico; nenhuma mensagem de exceção, nome de tabela ou stack trace atravessa a fronteira |
+
+Contrato completo em [`specs/001-core-banking-balance/contracts/balances-api.yaml`](specs/001-core-banking-balance/contracts/balances-api.yaml). Exemplos prontos em [`http/balances.http`](http/balances.http) (extensão REST Client do VS Code, cliente HTTP do IntelliJ, ou `make http`).
 
 ## Mensageria Kafka
 
-### Tópico `greeting-templates` (entrada)
+### Tópico `transactions-events` (entrada)
 
-Novos templates de saudação entram pelo Kafka, não por HTTP: `GreetingTemplateConsumer` escuta o tópico `greeting-templates` e persiste cada mensagem recebida via `SaveGreetingTemplateUseCase`.
+`TransactionEventConsumer` consome eventos financeiros e persiste o saldo que cada um carrega. O tópico tem **3 partições**, e as mensagens são publicadas com **`account.id` como chave**.
 
 **Schema da mensagem (JSON):**
 ```json
-{"id": "k1", "template": "Yo %s! Great to have you online!"}
+{
+  "transaction": {
+    "id": "8e8ae808-b154-48b5-9f3e-553935cc4543",
+    "type": "CREDIT", "amount": 97.07, "currency": "BRL",
+    "status": "APPROVED", "timestamp": 1751641364589998
+  },
+  "account": {
+    "id": "5b19c8b6-0cc4-4c72-a989-0c2ee15fa975",
+    "owner": "315e3cfe-f4af-4cd2-b298-a449e614349a",
+    "created_at": 1634874339000000, "status": "ENABLED",
+    "balance": { "amount": 183.12, "currency": "BRL" }
+  }
+}
 ```
 
-| Campo | Obrigatório | Descrição |
-|-|-|-|
-| `id` | Sim | Identificador do template (não pode ser vazio/branco) |
-| `template` | Sim | Texto do template, com `%s` como placeholder para o nome (não pode ser vazio/branco) |
+**`account.balance` é o snapshot autoritativo**, persistido literalmente. `transaction.amount` é informativo e **nunca** é aplicado a um saldo anterior — um `DEBIT` de `30.00` sobre um saldo de `70.00` persiste `70.00`, não `40.00`.
 
-**Como publicar uma mensagem de teste:**
-- Pelo Redpanda Console (http://localhost:8081) → tópico `greeting-templates` → *Produce Message*.
-- Via `rpk`: `docker compose run --rm --entrypoint rpk redpanda-seed topic produce greeting-templates --brokers redpanda:9092`.
-- Via `make kafka-seed`: roda novamente o job de seed, republicando as mensagens de [`infra/redpanda/greeting-templates-seed.jsonl`](infra/redpanda/greeting-templates-seed.jsonl) no tópico.
-- Exemplos prontos em [`infra/redpanda/greeting-templates-seed.jsonl`](infra/redpanda/greeting-templates-seed.jsonl) — os mesmos usados no seed inicial.
+Um evento só atualiza o saldo quando `transaction.status = APPROVED` **e** `account.status = ENABLED`. Status ausente ou desconhecido torna o evento **inelegível**, não a mensagem inválida.
+
+Schema formal em [`contracts/transaction-event.schema.json`](specs/001-core-banking-balance/contracts/transaction-event.schema.json).
+
+### Triagem de mensagens
+
+Toda mensagem recebida termina em um de três lugares:
+
+| Caso | Destino |
+|-|-|
+| Evento bem formado | processado; o offset é confirmado após o desfecho |
+| Bloco `transaction` **integralmente ausente** (`{"account": {...}}`) | **descartado de forma observável**, contabilizado em `balance.events.unsupported`, offset confirmado. **Não vai para a DLQ** |
+| JSON malformado, ou bloco `transaction` presente porém incompleto | **DLQ**, sem retry, com o payload original e o header nomeando o campo |
+
+A segunda linha existe para que a DLQ continue significando "algo está quebrado". Se ela também acumular mensagens que o consumer simplesmente não deveria processar, todo alerta sobre ela vira ruído ([ADR-009](docs/adr/009-three-way-message-triage.md)).
+
+### Tópico `transactions-events.dlq` (saída)
+
+Recebe mensagem inválida e retry esgotado — e nada além disso. O valor publicado é o **payload original**, sem reserialização, com a chave preservada, e os headers `kafka_dlt-*` mais `x-failure-reason` e `x-correlation-id`. Formato em [`contracts/dlq-message.md`](specs/001-core-banking-balance/contracts/dlq-message.md).
+
+### Ordenação, duplicidade e concorrência
+
+Nenhuma das três é resolvida no código da aplicação. Todas são decididas por **uma expressão condicional avaliada pelo DynamoDB dentro da mesma operação atômica que escreve**:
+
+```
+attribute_not_exists(#pk) OR #lastEventTimestamp < :incomingTimestamp
+```
+
+Não existe janela entre avaliar e escrever, então nenhum entrelaçamento de threads, consumers ou instâncias pode produzir *lost update* — e por isso **não há um único lock em todo o código**, garantia verificada por teste ([ADR-004](docs/adr/004-conditional-put-with-return-values-on-failure.md)).
+
+A chave da mensagem é **otimização de contenção, nunca argumento de corretude**: com ela a condição quase nunca reprova; sem ela reprova mais e o saldo persistido é idêntico.
+
+**Como publicar mensagens de teste:**
+- `make kafka-produce-transactions-events TOPIC=transactions-events COUNT=50` — eventos aleatórios, chaveados por conta, com timestamps embaralhados e status variados.
+- `make kafka-produce-accounts-events TOPIC=transactions-events COUNT=10` — eventos de **outro fluxo**, úteis para observar o descarte da linha 5a.
+- Pelo Redpanda Console (http://localhost:8081) → *Produce Message*.
 
 ## Imagens Docker utilizadas
 
@@ -217,10 +281,13 @@ Todas têm valor padrão para desenvolvimento local (fora do Docker Compose) e s
 |-|-|-|
 | `DYNAMODB_ENDPOINT` | `http://localhost:8000` | endpoint do DynamoDB |
 | `DYNAMODB_REGION` | `us-east-1` | região (fake, para o SDK) |
-| `GREETING_TABLE_NAME` | `GreetingMessages` | tabela do DynamoDB |
+| `BALANCE_TABLE_NAME` | `AccountBalances` | tabela do DynamoDB |
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:19092` | broker Kafka/Redpanda |
-| `KAFKA_CONSUMER_GROUP_ID` | `hello-greeting-template-consumer` | group id do consumer |
-| `GREETING_TEMPLATES_TOPIC` | `greeting-templates` | tópico consumido |
+| `KAFKA_CONSUMER_GROUP_ID` | `core-banking-balance-consumer` | group id do consumer |
+| `KAFKA_CONSUMER_CONCURRENCY` | `3` | threads do listener — o teto útil é a contagem de partições |
+| `TRANSACTIONS_TOPIC` | `transactions-events` | tópico consumido |
+| `TRANSACTIONS_DLQ_TOPIC` | `transactions-events.dlq` | tópico de dead-letter |
+| `BALANCE_API_TIMEZONE` | `America/Sao_Paulo` | fuso usado para renderizar `updated_at` |
 
 ## Como rodar
 
@@ -229,7 +296,7 @@ Pré-requisito único: **Docker** (com Docker Compose). O `make` já vem instala
 ```bash
 make up      # sobe tudo em background: app + DynamoDB + Redpanda (+ seeds + consoles)
 make logs    # acompanha os logs da aplicação
-curl "http://localhost:8080/hello?name=Ada"
+curl "http://localhost:8080/balances/5b19c8b6-0cc4-4c72-a989-0c2ee15fa975"
 make stop    # derruba tudo
 ```
 
@@ -279,9 +346,9 @@ Execute `make help` a qualquer momento para ver esta lista no terminal.
 
 | Comando | Descrição |
 |-|-|
-| `make db-up` | sobe o DynamoDB Local + console web e popula a tabela `GreetingMessages` |
-| `make db-seed` | roda novamente o job de seed (idempotente — a tabela não é recriada, os itens são sobrescritos) |
-| `make db-scan` | lista todos os itens atualmente na tabela |
+| `make db-up` | sobe o DynamoDB Local + console web e cria a tabela `AccountBalances` |
+| `make db-seed` | roda novamente o job de criação da tabela (idempotente). A tabela **não** é populada: um saldo só existe porque um evento elegível o criou |
+| `make db-scan` | lista os saldos atualmente armazenados |
 | `make db-down` | para o DynamoDB Local + console web |
 
 ### Kafka / Redpanda
@@ -290,8 +357,8 @@ Execute `make help` a qualquer momento para ver esta lista no terminal.
 
 | Comando | Descrição |
 |-|-|
-| `make kafka-up` | sobe o Redpanda + console web e popula o tópico `greeting-templates` |
-| `make kafka-seed` | roda novamente o job de seed (cria o tópico se não existir; mensagens são republicadas — tópicos Kafka são *append-only*, então o total de mensagens cresce a cada execução) |
+| `make kafka-up` | sobe o Redpanda + console web e cria os tópicos `transactions-events` e `transactions-events.dlq` (3 partições cada) |
+| `make kafka-seed` | roda novamente o job de criação dos tópicos (idempotente). Nenhuma mensagem é publicada: use os alvos `kafka-produce-*` para gerar tráfego |
 | `make kafka-topic-create NAME=meu-topico [PARTITIONS=3]` | cria um novo tópico no Redpanda com o nome e o número de partições informados (`PARTITIONS` é opcional, padrão `1`) |
 | `make kafka-produce-accounts-events TOPIC=meu-topico [COUNT=50]` | produz eventos de teste no formato `{"account": {...}}` (id/owner UUID aleatórios, `created_at` aleatório nos últimos 10 minutos, `status` ENABLED/DISABLED aleatório) para o tópico informado (`COUNT` é opcional, padrão `100`) |
 | `make kafka-produce-transactions-events TOPIC=meu-topico [COUNT=50]` | produz eventos de teste no formato `{"transaction": {...}, "account": {...}}` (id's UUID aleatórios, `type` CREDIT/DEBIT, `amount` aleatório de 0.01 a 10000, `status` APPROVED/DECLINED, `timestamp` aleatório nos últimos 10 minutos; `account.created_at` aleatório nos últimos 10 anos, `account.status` sempre ENABLED, `balance.amount` aleatório de 0.00 a 20000) para o tópico informado (`COUNT` é opcional, padrão `100`) |
@@ -319,15 +386,19 @@ O projeto tem duas suítes de teste bem separadas:
 ### `src/test` — testes unitários (`./gradlew test`)
 Não dependem de nenhuma infraestrutura externa — rodam em qualquer lugar, inclusive dentro do container Docker de teste (`make test`), sem Docker-in-Docker.
 
-- Testes de domínio, aplicação e adapters usando **fakes/mocks** para os *ports* (nenhuma chamada real a DynamoDB ou Kafka).
-- `GreetingControllerTest` usa `MockMvc` + `@MockitoBean` para isolar a camada web.
-- `HexagonalArchitectureTest` valida a direção de dependências entre as camadas (Konsist).
+- Domínio, aplicação e adapters com **fakes** escritos à mão para os *ports* (nenhuma chamada real a DynamoDB ou Kafka).
+- `BalanceControllerTest` usa `MockMvc` para o contrato REST; `BalanceResponseContractTest` compara a resposta com o próprio `balances-api.yaml`, para que código e contrato não divirjam em silêncio.
+- `DynamoDbBalanceWriterTest` afirma a expressão condicional **literalmente**: é o único ponto do sistema onde a corretude vive numa string interpretada por outro processo, e trocar `<` por `<=` não quebraria nenhum outro teste.
+- Três testes de arquitetura (Konsist) transformam princípios em build quebrado: `HexagonalArchitectureTest` (direção de dependências), `MonetaryPrecisionArchitectureTest` (nenhum `Double`/`Float` em produção) e `NoLockingArchitectureTest` (nenhum lock).
 
 ### `src/integrationTest` — testes de integração (`./gradlew integrationTest`)
 Rodam contra infraestrutura **real**, subida via Docker Compose. Ficam propositalmente fora do `check`/`test` para não exigir infra no pipeline padrão.
 
-- `DynamoDbGreetingTemplateIntegrationTest` — grava e lê de uma tabela DynamoDB real (`make db-up`).
-- `GreetingTemplateConsumerIntegrationTest` — sobe o contexto Spring real (incluindo o `@KafkaListener` de produção) conectado ao broker Redpanda real (`make kafka-up`); publica uma mensagem no tópico e valida que o *listener* da aplicação a consome sozinho.
+- `DynamoDbBalanceIntegrationTest` — duplicidade, evento antigo e empate de timestamp exercidos contra um DynamoDB real, que é onde essas garantias de fato moram.
+- `ConditionalWriteConcurrencyIntegrationTest` — **o mais importante do conjunto**: 32 threads liberadas por uma barreira escrevem a mesma conta, 20 vezes seguidas. A barreira não é cerimônia — sem ela as threads executam quase em série e o teste passa sem provar nada.
+- `TransactionEventConsumerIntegrationTest` — o `@KafkaListener` de produção contra o broker real.
+- `TransactionEventDlqIntegrationTest` — o que vai para a DLQ **e o que não vai**: um evento de outro fluxo não pode aparecer lá.
+- `EndToEndBalanceFlowIntegrationTest` — fluxo completo: sequência embaralhada com duplicata, `DECLINED`, `DISABLED` e mensagem de outro fluxo, e a resposta REST refletindo o snapshot elegível mais recente.
 
 Rode com `make integration-test` (sobe a infra necessária automaticamente antes de executar).
 
@@ -336,3 +407,22 @@ Rode com `make integration-test` (sobe a infra necessária automaticamente antes
 Configurado com **JaCoCo**, gate mínimo de **90% de cobertura de instruções**, que falha o build (`./gradlew check`) se não for atingido. Um resumo legível é impresso diretamente no output do Gradle (sem precisar abrir o relatório HTML), com contagem por tipo de métrica (instruções, branches, linhas, complexidade, métodos, classes) e o veredito do gate.
 
 Relatório HTML completo em `build/reports/jacoco/test/html/index.html` após rodar `./gradlew test` ou `make test`.
+
+## Decisões arquiteturais
+
+As decisões com consequências duradouras estão registradas em [`docs/adr/`](docs/adr/), cada uma com contexto, decisão, justificativa, consequências e alternativas descartadas.
+
+| ADR | Decisão |
+|-|-|
+| [001](docs/adr/001-conditional-write-for-idempotency.md) | Escrita condicional — **substituída pela 004**; mantida porque o raciocínio que registra continua valendo |
+| [002](docs/adr/002-account-id-as-kafka-message-key.md) | `accountId` como chave da mensagem — otimização de contenção, nunca argumento de corretude |
+| [003](docs/adr/003-strong-consistency-for-balance-reads.md) | Leitura fortemente consistente, sem cache |
+| [004](docs/adr/004-conditional-put-with-return-values-on-failure.md) | `PutItem` condicional com `ReturnValuesOnConditionCheckFailure` — o núcleo de corretude |
+| [005](docs/adr/005-single-retry-authority.md) | Uma única autoridade de retry; o SDK da AWS não retenta |
+| [006](docs/adr/006-decimal-string-money-representation.md) | Dinheiro como texto decimal em toda fronteira |
+| [007](docs/adr/007-single-deployable-with-profile-split.md) | Um deployable, com a separação desenhada mas não executada |
+| [008](docs/adr/008-account-partition-key-design.md) | `ACCOUNT#{accountId}` como partition key |
+| [009](docs/adr/009-three-way-message-triage.md) | Triagem em três vias — o que mantém a DLQ significando "algo quebrou" |
+| [010](docs/adr/010-response-instant-rendering.md) | Renderização de `updated_at` por truncamento, com offset local |
+
+A especificação, o plano de implementação, as tasks e os contratos vivem em [`specs/001-core-banking-balance/`](specs/001-core-banking-balance/).

@@ -1,0 +1,20 @@
+{
+  "transaction": {
+    "id": "8e8ae808-b154-48b5-9f3e-553935cc4543",
+    "type": "CREDIT",
+    "amount": 97.07,
+    "currency": "BRL",
+    "status": "APPROVED",
+    "timestamp": 1751641364589998
+  },
+  "account": {
+    "id": "5b19c8b6-0cc4-4c72-a989-0c2ee15fa975",
+    "owner": "315e3cfe-f4af-4cd2-b298-a449e614349a",
+    "created_at": 1634874339000000,
+    "status": "ENABLED",
+    "balance": {
+      "amount": 183.12,
+      "currency": "BRL"
+    }
+  }
+}
