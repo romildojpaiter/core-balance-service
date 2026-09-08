@@ -1,0 +1,209 @@
+openapi: 3.1.0
+
+info:
+  title: Core Banking — Balance Query API
+  version: 1.0.0
+  description: |
+    Consulta do saldo corrente de uma conta.
+
+    O saldo exposto é o **snapshot autoritativo** do evento elegível de maior
+    `transaction.timestamp` já aplicado à conta. O serviço é uma **projeção** de uma origem
+    upstream, não um ledger: ele não calcula, não acumula e não reconcilia saldos.
+
+    **Representação monetária**: `balance.amount` é um **número JSON com exatamente duas casas
+    decimais**, serializado a partir de uma representação decimal exata (FR-044, revisado em
+    2026-09-07). A escala sobrevive à serialização — `150.00` é emitido como `150.00`, nunca como
+    `150` — e o valor não transita por `Float`/`Double` em nenhum ponto (Constitution X, que proíbe
+    *tipos* de ponto flutuante binário, não a sintaxe de número do JSON). A garantia do serviço
+    termina na saída: o que o cliente faz ao desserializar é escolha do parser dele.
+
+    **O que este schema NÃO consegue exigir**: sob JSON Schema, `150` e `150.00` são o **mesmo número**,
+    e `multipleOf: 0.01` aceita os dois. A cláusula de escala de FR-044 é uma propriedade dos **bytes na
+    resposta**, não do valor — nenhum validador de schema a verifica, e uma regressão que emitisse `150`
+    passaria por este contrato sem erro. A garantia real é `BalanceResponseContractTest`, que afere o
+    corpo bruto, mais `MonetaryPrecisionArchitectureTest`, que proíbe `Double` em produção.
+
+    **Ao conferir a resposta manualmente**: clientes JavaScript — Postman, Insomnia, REST Client do
+    VS Code, DevTools — executam `JSON.parse`, que lê `150.00` num `double` de 64 bits e reimprime `150`.
+    A escala é perdida **no visualizador**, depois de sair do serviço. Para ver os bytes reais use
+    `curl` sem formatador, `curl … | od -c`, ou `jq`, que preserva o literal. Ver research.md R19,
+    adendo de 2026-09-07.
+
+    **Corpo fechado**: a resposta `200` tem **exatamente** quatro chaves de topo — `id`, `owner`,
+    `balance`, `updated_at` — e nenhuma outra (`additionalProperties: false`). `lastTransactionId`
+    **não** é exposto (FR-043a); ele continua persistido, porque é o operando que distingue
+    reentrega de conflito na escrita condicional, e continua nos logs estruturados.
+
+    Contrato conforme `spec.md` FR-042 a FR-051.
+
+servers:
+  - url: http://localhost:8080
+    description: Ambiente local (docker compose)
+
+paths:
+  /balances/{accountId}:
+    get:
+      summary: Consulta o saldo corrente de uma conta
+      operationId: getBalance
+      description: |
+        Leitura fortemente consistente (ADR-003, FR-033): nunca retorna estado anterior a uma
+        escrita já concluída para aquela conta.
+
+        A operação não altera o estado de nenhuma conta (FR-051).
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          description: |
+            Identificador da conta. Deve ser não vazio e composto apenas por `[A-Za-z0-9-]` (A-05).
+            O formato é validado **antes** de qualquer acesso ao armazenamento (FR-048).
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9-]+$'
+            minLength: 1
+          example: 5b19c8b6-0cc4-4c72-a989-0c2ee15fa975
+        - name: X-Correlation-Id
+          in: header
+          required: false
+          description: Identificador de correlação. Se ausente, é gerado e devolvido na resposta.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Conta com estado corrente
+          headers:
+            X-Correlation-Id:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceResponse'
+              examples:
+                positivo:
+                  summary: Saldo positivo
+                  value:
+                    id: 5b19c8b6-0cc4-4c72-a989-0c2ee15fa975
+                    owner: 315e3cfe-f4af-4cd2-b298-a449e614349a
+                    balance:
+                      amount: 183.12
+                      currency: BRL
+                    updated_at: "2025-07-05T18:04:13.433-03:00"
+                negativo:
+                  summary: Saldo negativo (permitido, A-09)
+                  value:
+                    id: acc-12345
+                    owner: own-12345
+                    balance:
+                      amount: -50.25
+                      currency: BRL
+                    updated_at: "2024-09-05T13:00:00.000-03:00"
+        '400':
+          description: |
+            `accountId` viola o formato aceito (FR-048). O armazenamento **não** é consultado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: INVALID_ACCOUNT_ID
+                message: accountId must be non-empty and match [A-Za-z0-9-]
+        '404':
+          description: |
+            A conta não possui estado corrente (FR-047). O sistema **não** inventa saldo zero:
+            afirmar `0.00` para uma conta desconhecida afirmaria um fato financeiro que o sistema
+            não conhece (Constitution I). Uma conta que só recebeu eventos inelegíveis cai aqui.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: BALANCE_NOT_FOUND
+                message: No balance found for the given account
+        '500':
+          description: |
+            Falha interna (FR-049). O corpo é genérico: nenhuma mensagem de exceção, nome de tabela,
+            endpoint ou stack trace atravessa a fronteira. O erro completo é registrado no servidor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: INTERNAL_ERROR
+                message: Unexpected error
+
+components:
+  schemas:
+    BalanceResponse:
+      type: object
+      required: [id, owner, balance, updated_at]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          description: Identificador da conta consultada.
+          example: 5b19c8b6-0cc4-4c72-a989-0c2ee15fa975
+        owner:
+          type: string
+          minLength: 1
+          description: |
+            Identificador do titular da conta. **Sempre presente e nunca nulo**: `account.owner` é
+            estruturalmente obrigatório na ingestão (FR-003a), então nenhum saldo pode existir sem
+            titular. Um evento sem ele nunca chega a ser persistido — vai para a DLQ.
+          example: 315e3cfe-f4af-4cd2-b298-a449e614349a
+        balance:
+          $ref: '#/components/schemas/BalanceAmount'
+        updated_at:
+          type: string
+          format: date-time
+          description: |
+            Instante do snapshot aplicado, derivado de `transaction.timestamp`. ISO-8601 com **offset
+            local** (fuso por configuração, padrão `America/Sao_Paulo`) e precisão de
+            **milissegundos**, obtida por truncamento dos microssegundos persistidos (FR-046).
+            Não é a hora em que o registro foi gravado: descreve quando a transação ocorreu na origem.
+          example: "2025-07-05T18:04:13.433-03:00"
+
+    BalanceAmount:
+      type: object
+      required: [amount, currency]
+      additionalProperties: false
+      properties:
+        amount:
+          type: number
+          multipleOf: 0.01
+          format: decimal
+          description: |
+            Saldo corrente como **número JSON com exatamente duas casas decimais** (FR-044,
+            revisado em 2026-09-07), serializado a partir de decimal exato. A escala é preservada
+            na serialização: `150.00` é emitido como `150.00`, nunca como `150`. Valores negativos
+            são possíveis (A-09).
+
+            O valor não transita por `Float`/`Double` em nenhum ponto do sistema — nem no domínio,
+            nem na persistência (onde é gravado como `S` justamente para preservar a escala), nem
+            na serialização.
+
+            `multipleOf: 0.01` é a aproximação mais próxima que o JSON Schema oferece, e **não** exige
+            as duas casas: `150` satisfaz esta declaração tanto quanto `150.00`. A escala é verificada
+            pelo teste de contrato sobre o corpo bruto, não aqui. Um cliente JavaScript exibirá `150`
+            ainda que o serviço tenha emitido `150.00` — ver a nota em `info.description`.
+          examples: [183.12, -50.25, 0.00]
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: |
+            Código ISO 4217 de três letras maiúsculas, exatamente como persistido (FR-045). Nunca
+            inferido nem convertido.
+          example: BRL
+
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      additionalProperties: false
+      description: Formato consistente para toda resposta de erro (FR-050).
+      properties:
+        code:
+          type: string
+          enum: [INVALID_ACCOUNT_ID, BALANCE_NOT_FOUND, INTERNAL_ERROR]
+        message:
+          type: string
+          description: Mensagem legível. Nunca contém detalhes internos (FR-049).

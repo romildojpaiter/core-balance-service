@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://itau.com.br/challenge/core-banking-balance/transaction-event.schema.json",
+  "title": "Transaction Event",
+  "description": "Evento financeiro consumido do topico 'transactions-events'. O bloco account.balance e o snapshot autoritativo do saldo no instante da transacao, NAO um delta (Constitution VIII, FR-013/FR-014). Um evento que viole este schema e uma mensagem invalida: DLQ sem retry (FR-004, FR-038, matriz linha 6). Revisado em 2026-09-07: account.owner passou a ser obrigatorio (FR-003a). Ausencia ou valor desconhecido de transaction.status / account.status NAO viola o schema: torna o evento inelegivel (A-06, matriz linha 5).",
+  "type": "object",
+  "required": ["transaction", "account"],
+  "additionalProperties": true,
+  "properties": {
+    "transaction": {
+      "type": "object",
+      "required": ["id", "timestamp"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Identificador da transacao. Base da deteccao de duplicidade (FR-017, FR-023).",
+          "examples": ["8e8ae808-b154-48b5-9f3e-553935cc4543"]
+        },
+        "type": {
+          "type": ["string", "null"],
+          "description": "Informativo. NUNCA influencia a decisao de saldo.",
+          "examples": ["CREDIT", "DEBIT"]
+        },
+        "amount": {
+          "type": ["number", "string", "null"],
+          "description": "Valor da transacao. Informativo apenas: nunca e aplicado a um saldo anterior (FR-014). Deve ser desserializado para decimal exato, nunca ponto flutuante (Constitution X).",
+          "examples": [97.07]
+        },
+        "currency": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Z]{3}$",
+          "description": "Moeda da transacao (ISO 4217).",
+          "examples": ["BRL"]
+        },
+        "status": {
+          "type": ["string", "null"],
+          "description": "Elegibilidade exige exatamente 'APPROVED' (FR-008). Ausente ou desconhecido => inelegivel, nao invalido (A-06).",
+          "examples": ["APPROVED", "DECLINED"]
+        },
+        "timestamp": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "description": "Microssegundos desde a epoca Unix (A-02). E o marcador de frescor: unico criterio de ordenacao (FR-016, FR-019).",
+          "examples": [1751641364589998]
+        }
+      }
+    },
+    "account": {
+      "type": "object",
+      "required": ["id", "owner", "balance"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9-]+$",
+          "description": "Identificador da conta. E a chave de particionamento do topico (FR-006) e a autoridade em caso de divergencia com a chave da mensagem (Edge Cases).",
+          "examples": ["5b19c8b6-0cc4-4c72-a989-0c2ee15fa975"]
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Identificador do titular. OBRIGATORIO desde 2026-09-07 (FR-003a): no dominio do problema toda conta pertence a um titular, entao um evento sem ele descreve uma conta que nao pode existir e e um defeito do produtor. Ausencia => mensagem invalida, DLQ sem retry (linha 6 da matriz). Consequencia aceita: um evento com saldo valido mas sem titular NAO atualiza o saldo. Exposto na resposta REST como 'owner'.",
+          "examples": ["315e3cfe-f4af-4cd2-b298-a449e614349a"]
+        },
+        "created_at": {
+          "type": ["integer", "null"],
+          "description": "Microssegundos desde a epoca Unix. Lido mas nao utilizado nesta feature."
+        },
+        "status": {
+          "type": ["string", "null"],
+          "description": "Elegibilidade exige exatamente 'ENABLED' (FR-008). Ausente ou desconhecido => inelegivel, nao invalido (A-06).",
+          "examples": ["ENABLED", "DISABLED"]
+        },
+        "balance": {
+          "type": "object",
+          "description": "SNAPSHOT AUTORITATIVO do saldo. E persistido literalmente (FR-013). Nunca derivado de transaction.amount (FR-014).",
+          "required": ["amount", "currency"],
+          "additionalProperties": true,
+          "properties": {
+            "amount": {
+              "type": ["number", "string"],
+              "description": "Saldo da conta no instante da transacao. No maximo 2 casas decimais (A-12); mais que isso torna a mensagem invalida, pois arredondamento implicito e proibido (Constitution X, Edge Cases). Valor negativo e aceito (A-09).",
+              "examples": [183.12, -50.25]
+            },
+            "currency": {
+              "type": "string",
+              "pattern": "^[A-Z]{3}$",
+              "description": "Moeda do saldo (ISO 4217). Persistida como recebida; nunca inferida, assumida ou convertida (FR-015).",
+              "examples": ["BRL"]
+            }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "transaction": {
+        "id": "8e8ae808-b154-48b5-9f3e-553935cc4543",
+        "type": "CREDIT",
+        "amount": 97.07,
+        "currency": "BRL",
+        "status": "APPROVED",
+        "timestamp": 1751641364589998
+      },
+      "account": {
+        "id": "5b19c8b6-0cc4-4c72-a989-0c2ee15fa975",
+        "owner": "315e3cfe-f4af-4cd2-b298-a449e614349a",
+        "created_at": 1634874339000000,
+        "status": "ENABLED",
+        "balance": {
+          "amount": 183.12,
+          "currency": "BRL"
+        }
+      }
+    }
+  ]
+}

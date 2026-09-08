@@ -1,0 +1,62 @@
+### Core Banking — Balance Query
+# Run with the VS Code REST Client extension, IntelliJ's HTTP client, or `make http`.
+# The environment is defined in http-client.env.json.
+
+### Query a balance that exists.
+# Publish an eligible event first, e.g.:
+#   make kafka-produce-transactions-events TOPIC=transactions-events COUNT=20
+#   make db-scan            # pick an accountId that was written
+GET {{host}}/balances/{{accountId}}
+Accept: application/json
+X-Correlation-Id: manual-{{$uuid}}
+
+> {%
+    client.test("200 with the contract body", function() {
+        client.assert(response.status === 200, "expected 200, got " + response.status);
+
+        // Exactly four keys. An extra one is a contract break even when nothing consumes it.
+        const keys = Object.keys(response.body).sort().join(",");
+        client.assert(keys === "balance,id,owner,updated_at", "unexpected body keys: " + keys);
+
+        client.assert(typeof response.body.balance.amount === "number",
+            "amount must be a JSON number serialised from an exact decimal");
+        // Only the value is checkable here. The client has already parsed 183.12 into a JavaScript
+        // number, where 150.00 and 150 are the same thing — the two decimal places the contract
+        // requires are a property of the bytes on the wire, and this runner cannot see them.
+        // BalanceResponseContractTest asserts the raw body and is the real guard for the scale.
+        const cents = Math.round(response.body.balance.amount * 100);
+        client.assert(Math.abs(response.body.balance.amount * 100 - cents) < 1e-6,
+            "amount must be a whole number of cents, got " + response.body.balance.amount);
+        client.assert(response.body.updated_at !== undefined, "updated_at is required");
+    });
+%}
+
+### An account the system has never seen: 404, never a zero balance.
+# 0.00 is a real balance. Returning it here would assert a financial fact the system does not know.
+GET {{host}}/balances/acc-does-not-exist-0000
+Accept: application/json
+
+> {%
+    client.test("404 with a stable error code", function() {
+        client.assert(response.status === 404, "expected 404, got " + response.status);
+        client.assert(response.body.code === "BALANCE_NOT_FOUND");
+    });
+%}
+
+### A malformed account id: 400, and the datastore is never touched.
+GET {{host}}/balances/conta%2042
+Accept: application/json
+
+> {%
+    client.test("400 before any storage access", function() {
+        client.assert(response.status === 400, "expected 400, got " + response.status);
+        client.assert(response.body.code === "INVALID_ACCOUNT_ID");
+    });
+%}
+
+### Health.
+GET {{host}}/actuator/health
+Accept: application/json
+
+### Metrics (Prometheus format) — balance.* series appear once events have been processed.
+GET {{host}}/actuator/prometheus

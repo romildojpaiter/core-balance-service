@@ -1,0 +1,121 @@
+openapi: 3.0.3
+info:
+  title: Balance Query API
+  version: 1.0.0
+  description: API for querying current account balance
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development server
+
+paths:
+  /balances/{accountId}:
+    get:
+      summary: Get current balance for an account
+      description: Returns the most recent balance snapshot for the specified account. Returns zero balance if the account has no stored snapshot.
+      operationId: getBalance
+      tags:
+        - Balance
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          description: Unique account identifier
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9-]+$'
+            minLength: 1
+            example: acc-12345
+      responses:
+        '200':
+          description: Balance retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceResponse'
+              examples:
+                existing_account:
+                  summary: Account with balance
+                  value:
+                    accountId: acc-12345
+                    balance: "150.00"
+                    currency: BRL
+                    lastTransactionId: tx-001
+                    timestamp: 1725552000000000
+                zero_balance:
+                  summary: Account with no transactions
+                  value:
+                    accountId: acc-99999
+                    balance: "0.00"
+                    currency: null
+                    lastTransactionId: null
+                    timestamp: null
+        '400':
+          description: Invalid account ID format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                timestamp: "2026-09-05T10:30:00Z"
+                status: 400
+                error: "Bad Request"
+                message: "Account ID must be alphanumeric with hyphens only"
+                path: "/api/v1/balances/invalid@account"
+
+components:
+  schemas:
+    BalanceResponse:
+      type: object
+      required:
+        - accountId
+        - balance
+      properties:
+        accountId:
+          type: string
+          description: Account identifier
+          example: acc-12345
+        balance:
+          type: string
+          description: Current balance formatted with 2 decimal places
+          example: "150.00"
+        currency:
+          type: string
+          nullable: true
+          description: ISO 4217 currency code (null for zero balance)
+          example: BRL
+        lastTransactionId:
+          type: string
+          nullable: true
+          description: ID of the last applied transaction
+          example: tx-001
+        timestamp:
+          type: integer
+          nullable: true
+          format: int64
+          description: Timestamp of the last applied event (microseconds since epoch)
+          example: 1725552000000000
+
+    ErrorResponse:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: Time when the error occurred
+        status:
+          type: integer
+          description: HTTP status code
+        error:
+          type: string
+          description: Error type
+        message:
+          type: string
+          description: Human-readable error message
+        path:
+          type: string
+          description: Request path that caused the error
+
+tags:
+  - name: Balance
+    description: Balance query operations

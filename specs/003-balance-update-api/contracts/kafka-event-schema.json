@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://itau.com.br/schemas/balance-event-v1.json",
+  "title": "Balance Update Event",
+  "description": "Schema for balance snapshot events consumed from Kafka topic 'balance-updates'",
+  "type": "object",
+  "required": ["transaction", "account"],
+  "properties": {
+    "transaction": {
+      "type": "object",
+      "required": ["id", "timestamp"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Unique transaction identifier",
+          "examples": ["tx-001", "tx-abc-123"]
+        },
+        "timestamp": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Event timestamp in microseconds since epoch",
+          "examples": [1725552000000000]
+        }
+      },
+      "additionalProperties": false
+    },
+    "account": {
+      "type": "object",
+      "required": ["id", "balance"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9-]+$",
+          "description": "Account identifier (alphanumeric with hyphens)",
+          "examples": ["acc-12345", "account-abc-999"]
+        },
+        "balance": {
+          "type": "object",
+          "required": ["amount", "currency"],
+          "properties": {
+            "amount": {
+              "type": "string",
+              "pattern": "^-?\\d+\\.\\d{2}$",
+              "description": "Balance amount as decimal string with exactly 2 decimal places",
+              "examples": ["150.00", "-50.25", "0.00"]
+            },
+            "currency": {
+              "type": "string",
+              "pattern": "^[A-Z]{3}$",
+              "description": "ISO 4217 currency code (3 uppercase letters)",
+              "examples": ["BRL", "USD", "EUR"]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
